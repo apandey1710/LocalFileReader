@@ -62,9 +62,20 @@
           <svg viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-2.64-6.36L21 8"/><path d="M21 3v5h-5"/></svg>
         </button>
       </div>
-      <div class="search-box">
-        <input type="search" id="search" placeholder="Search files…  ( / )" autocomplete="off" spellcheck="false"
-               aria-label="Search file names" aria-controls="search-results">
+      <div class="search-box" id="search-box">
+        <input type="search" id="search" placeholder="Search file names…  ( / )" autocomplete="off" spellcheck="false"
+               aria-label="Search" aria-controls="search-results">
+        <div class="search-opts">
+          <div class="seg" role="group" aria-label="Search mode">
+            <button type="button" data-mode="names" title="Search file and folder names (/ or Ctrl+K)">Names</button>
+            <button type="button" data-mode="contents" title="Search inside Markdown files (Ctrl+Shift+F)">Contents</button>
+          </div>
+          <span class="spacer"></span>
+          <button type="button" class="opt" data-opt="case" title="Match case" aria-pressed="false">Aa</button>
+          <button type="button" class="opt" data-opt="word" title="Match whole word" aria-pressed="false"><u>ab</u></button>
+          <button type="button" class="opt" data-opt="regex" title="Use regular expression (Python syntax)" aria-pressed="false">.*</button>
+          <button type="button" class="opt" data-opt="all" title="Also search node_modules, .git, virtualenvs and caches" aria-pressed="false">all</button>
+        </div>
         <div class="search-status" id="search-status"></div>
       </div>
       <nav class="tree" id="tree" role="tree" aria-label="File tree"></nav>

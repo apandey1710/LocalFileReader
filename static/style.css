@@ -135,6 +135,15 @@ body.resizing iframe { pointer-events: none; }
   width: 100%; padding: 4px 8px; border-radius: 6px;
   border: 1px solid var(--border); background: var(--bg);
 }
+.search-opts { display: flex; align-items: center; gap: 2px; padding-top: 5px; }
+.search-opts .seg button { padding: 1px 8px; font-size: 11px; }
+.search-opts .opt {
+  border: 1px solid transparent; background: transparent; border-radius: 4px;
+  font: 600 11px/1 var(--font-mono); color: var(--fg-muted); padding: 3px 5px; cursor: pointer;
+}
+.search-opts .opt:hover { background: var(--bg-hover); color: var(--fg); }
+.search-opts .opt[aria-pressed="true"] { background: var(--bg-active); border-color: var(--accent); color: var(--fg); }
+.search-box:not(.contents) .opt { display: none; }
 .search-status { font-size: 11px; color: var(--fg-faint); padding: 3px 2px 0; min-height: 1.4em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .search-status.error { color: var(--danger); }
 
@@ -152,6 +161,20 @@ body.resizing iframe { pointer-events: none; }
 .search-results .r-name, .search-results .r-dir { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .search-results .r-dir { font-size: 11px; color: var(--fg-faint); direction: rtl; text-align: left; }
 .search-results mark { background: color-mix(in srgb, #f2c94c 45%, transparent); color: inherit; border-radius: 2px; }
+/* content search groups */
+.search-results li.g-file { padding-top: 5px; gap: 4px; }
+.search-results li.g-file .chev { width: 13px; height: 13px; color: var(--fg-faint); transition: transform .12s; transform: rotate(90deg); }
+.search-results li.g-file.collapsed .chev { transform: none; }
+.search-results li.g-file .r-text { flex: 1; }
+.search-results .g-count {
+  font-size: 11px; color: var(--fg-muted); background: var(--bg-hover);
+  border-radius: 999px; padding: 0 6px; margin-left: auto; flex: none;
+}
+.search-results li.g-line { padding: 1px 10px 1px 28px; align-items: baseline; gap: 8px; }
+.search-results .g-ln { font: 11px var(--font-mono); color: var(--fg-faint); min-width: 3ch; text-align: right; flex: none; }
+.search-results .g-text { font: 12px/1.45 var(--font-mono); white-space: pre; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.search-results li.g-more { padding: 1px 10px 3px 28px; color: var(--accent); font-size: 12px; cursor: pointer; }
+.search-results li.g-more:hover { text-decoration: underline; }
 .search-results .r-note { padding: 6px 12px; color: var(--fg-muted); font-style: italic; }
 
 /* ---------- tree ---------- */
@@ -220,6 +243,8 @@ body.resizing iframe { pointer-events: none; }
   color: var(--fg-faint); user-select: none;
 }
 .code .line:hover { background: var(--bg-soft); }
+.code .line.target { background: color-mix(in srgb, #f2c94c 22%, transparent); box-shadow: inset 3px 0 0 #e3b341; }
+.code mark.hit { background: color-mix(in srgb, #f2c94c 55%, transparent); color: inherit; border-radius: 2px; }
 .wrap .code { white-space: pre-wrap; overflow-wrap: anywhere; width: auto; }
 .hljs { background: transparent !important; color: inherit; }
 
@@ -259,6 +284,12 @@ body.resizing iframe { pointer-events: none; }
 .markdown h1:hover .heading-anchor, .markdown h2:hover .heading-anchor, .markdown h3:hover .heading-anchor,
 .markdown h4:hover .heading-anchor { opacity: 1; }
 .markdown .front-matter { font-size: .8em; }
+.markdown .md-target {
+  background: color-mix(in srgb, #f2c94c 10%, transparent);
+  box-shadow: -12px 0 0 color-mix(in srgb, #f2c94c 10%, transparent), -15px 0 0 #e3b341;
+  border-radius: 0 4px 4px 0;
+}
+.markdown mark.hit { background: color-mix(in srgb, #f2c94c 55%, transparent); color: inherit; border-radius: 2px; }
 
 /* html / pdf / image */
 .frame { border: 0; width: 100%; height: 100%; flex: 1; background: #fff; }

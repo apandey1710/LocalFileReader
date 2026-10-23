@@ -140,6 +140,8 @@
     loadToken: 0,
     pollTimer: null,
     pendingAnchor: null,
+    line: null, // 1-based line to scroll to and highlight
+    lineMarks: null, // [start, end) ranges within that line to highlight
   };
 
   const dom = {
@@ -168,6 +170,7 @@
     const params = new URLSearchParams();
     if (state.root) params.set("root", state.root);
     if (state.file) params.set("file", state.file);
+    if (state.file && state.line) params.set("line", state.line);
     const url = `${location.pathname}?${params}`.replace(/\?$/, "") + location.hash;
     if (url === location.pathname + location.search + location.hash) return;
     history[push ? "pushState" : "replaceState"](null, "", url);
@@ -177,11 +180,12 @@
     const params = new URLSearchParams(location.search);
     const root = params.get("root") || store.get("lastRoot", null);
     const file = params.get("file");
+    const line = Number(params.get("line")) || null;
     if (root && root !== state.root) {
       const ok = await setRoot(root, { push: false, keepFile: true });
       if (!ok && !file) return openPicker();
     }
-    if (file && file !== state.file) await openFile(file, { push: false });
+    if (file && (file !== state.file || line !== state.line)) await openFile(file, { push: false, line });
     else if (!file && state.file) clearViewer();
     if (!state.root && !file) openPicker();
   }
@@ -396,6 +400,7 @@
   function refreshTree() {
     state.dirCache.clear();
     buildIndex();
+    if (searchMode === "contents" && dom.search.value.trim()) runGrep();
     const scroll = dom.tree.scrollTop;
     return renderTree().then(() => {
       dom.tree.scrollTop = scroll;
@@ -543,7 +548,8 @@
       search.error = e.message;
     }
     search.loading = false;
-    runSearch();
+    if (searchMode === "names") runSearch();
+    else updateSearchStatus();
   }
 
   const isSubsequence = (needle, hay) => fuzzySpan(needle, hay) !== -1;
@@ -650,7 +656,7 @@
         class: "result" + (i === search.selected ? " selected" : ""),
         role: "option",
         title: e.rel,
-        dataset: { index: i, path: joinPath(search.root, e.rel) },
+        dataset: { kind: e.isDir ? "dir" : "file", path: joinPath(search.root, e.rel), key: e.rel },
       }, svg(e.isDir ? ICON.folder : ICON.file, "ico" + (e.isDir ? " folder" : "")), text));
     });
     if (!search.results.length && !search.loading) {
@@ -663,6 +669,13 @@
 
   function updateSearchStatus() {
     const status = $("#search-status");
+    if (searchMode === "contents") {
+      const text = grepStatus();
+      status.classList.toggle("error", Boolean(grep.error));
+      status.textContent = text;
+      status.title = text;
+      return;
+    }
     status.classList.toggle("error", Boolean(search.error));
     const fmt = (n) => n.toLocaleString();
     let text = "";
@@ -689,35 +702,53 @@
   }
 
   function openResult(li) {
-    const entry = search.results[Number(li.dataset.index)];
-    if (!entry) return;
-    const path = li.dataset.path;
-    if (entry.isDir) {
+    selectResult([...dom.results.querySelectorAll("li.result")].indexOf(li));
+    const { kind, path } = li.dataset;
+    if (kind === "dir") {
       clearSearch();
       revealPath(path, true);
+    } else if (kind === "gfile" || kind === "gline") {
+      const line = Number(li.dataset.line) || null;
+      const m = grep.files.find((f) => f.path === li.dataset.rel)?.lines.find((l) => l.line === line);
+      // Snippet ranges are relative to the snippet; shift them onto the full line.
+      const marks = m ? m.ranges.map(([s, e]) => [s + m.col, e + m.col]) : null;
+      openFile(path, { line, marks });
     } else {
-      search.selected = Number(li.dataset.index);
-      selectResult(search.selected);
       openFile(path);
     }
   }
 
   function clearSearch() {
     dom.search.value = "";
-    runSearch();
+    stopGrep();
+    rerunSearch();
   }
 
   function initSearch() {
     dom.search.addEventListener("input", () => {
       clearTimeout(search.timer);
-      search.timer = setTimeout(runSearch, search.entries.length > 50000 ? 120 : 40);
+      clearTimeout(grep.timer);
+      if (searchMode === "names") {
+        search.timer = setTimeout(runSearch, search.entries.length > 50000 ? 120 : 40);
+        return;
+      }
+      // Content searches cost a walk of the whole tree: wait for a pause in
+      // typing, and only search single characters when Enter is pressed.
+      const q = dom.search.value.trim();
+      if (!q || q.length >= 2) grep.timer = setTimeout(runGrep, q ? 300 : 0);
+      else {
+        stopGrep();
+        updateSearchStatus();
+      }
     });
     dom.search.addEventListener("keydown", (e) => {
       if (e.key === "ArrowDown") selectResult(search.selected + 1);
       else if (e.key === "ArrowUp") selectResult(search.selected - 1);
+      else if (e.key === "Enter" && searchMode === "contents" && grep.query !== dom.search.value) runGrep();
       else if (e.key === "Enter") {
         clearTimeout(search.timer);
-        if (search.terms?.join(" ") !== dom.search.value.trim().toLowerCase().split(/\s+/).join(" ")) runSearch();
+        const stale = search.terms?.join(" ") !== dom.search.value.trim().toLowerCase().split(/\s+/).join(" ");
+        if (searchMode === "names" && stale) runSearch();
         const li = dom.results.querySelectorAll("li.result")[search.selected];
         if (li) openResult(li);
       } else if (e.key === "Escape") {
@@ -728,16 +759,36 @@
       e.preventDefault();
     });
     dom.results.addEventListener("click", (e) => {
+      const more = e.target.closest("li.g-more");
+      if (more) {
+        grep.expanded.add(more.dataset.rel);
+        return renderGrep();
+      }
       const li = e.target.closest("li.result");
-      if (li) openResult(li);
+      if (!li) return;
+      if (li.classList.contains("g-file") && e.target.closest(".chev")) {
+        const rel = li.dataset.rel;
+        if (!grep.collapsed.delete(rel)) grep.collapsed.add(rel);
+        return renderGrep();
+      }
+      openResult(li);
     });
-    // "/" or Ctrl/Cmd+K focuses search from anywhere.
+    // "/" or Ctrl/Cmd+K focuses search from anywhere; Ctrl/Cmd+Shift+F
+    // switches to content search, seeded with any selected text.
     document.addEventListener("keydown", (e) => {
       const typing = e.target.closest?.("input, textarea, select, [contenteditable]");
-      const slash = e.key === "/" && !typing && !e.ctrlKey && !e.metaKey && !e.altKey;
-      const ctrlK = e.key.toLowerCase() === "k" && (e.ctrlKey || e.metaKey);
-      if ((!slash && !ctrlK) || dom.picker.open || !state.root) return;
+      const key = e.key.toLowerCase();
+      const mod = e.ctrlKey || e.metaKey;
+      const slash = e.key === "/" && !typing && !mod && !e.altKey;
+      const ctrlK = key === "k" && mod && !e.shiftKey;
+      const findInFiles = key === "f" && mod && e.shiftKey;
+      if ((!slash && !ctrlK && !findInFiles) || dom.picker.open || !state.root) return;
       e.preventDefault();
+      if (findInFiles) {
+        const selected = String(getSelection()).trim();
+        if (selected && !selected.includes("\n") && selected.length <= 200) dom.search.value = selected;
+        setSearchMode("contents");
+      }
       if (dom.layout.classList.contains("tree-hidden") && !mobile.matches) {
         dom.layout.classList.remove("tree-hidden");
         store.set("treeHidden", false);
@@ -746,6 +797,259 @@
       dom.search.focus();
       dom.search.select();
     });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Content search, streamed from /api/grep as NDJSON
+  // ---------------------------------------------------------------------------
+
+  const GREP_LINES_SHOWN = 3; // per file, until "+N more" is clicked
+  const GREP_FILES_SHOWN = 500;
+
+  const grep = {
+    controller: null,
+    query: null,
+    files: [],
+    progress: null,
+    done: null,
+    running: false,
+    error: null,
+    expanded: new Set(),
+    collapsed: new Set(),
+    renderTimer: null,
+    timer: null,
+  };
+  const grepOpts = { case: false, word: false, regex: false, all: false, ...store.get("grepOpts", {}) };
+  let searchMode = store.get("searchMode", "names");
+
+  function stopGrep() {
+    clearTimeout(grep.timer);
+    grep.controller?.abort();
+    grep.controller = null;
+    grep.running = false;
+  }
+
+  async function runGrep() {
+    stopGrep();
+    const q = dom.search.value;
+    const active = Boolean(q.trim());
+    dom.tree.hidden = active;
+    dom.results.hidden = !active;
+    Object.assign(grep, {
+      query: q, files: [], progress: null, done: null, error: null,
+      expanded: new Set(), collapsed: new Set(),
+    });
+    dom.results.replaceChildren();
+    if (!active) return updateSearchStatus();
+
+    const controller = new AbortController();
+    grep.controller = controller;
+    grep.running = true;
+    updateSearchStatus();
+    const params = { path: state.root, q, hidden: settings.showHidden ? 1 : 0 };
+    for (const k of ["case", "word", "regex", "all"]) if (grepOpts[k]) params[k] = 1;
+    try {
+      const res = await fetch(`/api/grep?${new URLSearchParams(params)}`, { signal: controller.signal, cache: "no-store" });
+      if (res.status === 401) {
+        location.href = "/login";
+        return;
+      }
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error || res.statusText);
+      }
+      // One JSON object per line; a chunk can end mid-line, so buffer.
+      const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+      let buf = "";
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += value;
+        let nl;
+        while ((nl = buf.indexOf("\n")) !== -1) {
+          const line = buf.slice(0, nl);
+          buf = buf.slice(nl + 1);
+          if (line) handleGrepEvent(JSON.parse(line));
+        }
+      }
+    } catch (e) {
+      if (controller.signal.aborted) return;
+      grep.error = e.message;
+    }
+    if (controller !== grep.controller) return;
+    grep.controller = null;
+    grep.running = false;
+    clearTimeout(grep.renderTimer);
+    grep.renderTimer = null;
+    renderGrep();
+    updateSearchStatus();
+  }
+
+  function handleGrepEvent(ev) {
+    if (ev.type === "file") {
+      grep.files.push(ev);
+      // Re-rank and redraw at most every 150ms while results stream in.
+      grep.renderTimer ??= setTimeout(() => {
+        grep.renderTimer = null;
+        renderGrep();
+        updateSearchStatus();
+      }, 150);
+    } else if (ev.type === "progress") {
+      grep.progress = ev;
+      updateSearchStatus();
+    } else if (ev.type === "done") {
+      grep.done = ev;
+    }
+  }
+
+  // HTML for `text` with the given [start, end) ranges wrapped in <mark>.
+  function markRanges(text, ranges) {
+    let out = "";
+    let at = 0;
+    for (const [s, e] of ranges) {
+      if (s < at) continue;
+      out += escapeHtml(text.slice(at, s)) + "<mark>" + escapeHtml(text.slice(s, e)) + "</mark>";
+      at = e;
+    }
+    return out + escapeHtml(text.slice(at));
+  }
+
+  function renderGrep() {
+    const scroll = dom.results.scrollTop;
+    const selectedKey = dom.results.querySelector("li.result.selected")?.dataset.key;
+    const files = [...grep.files].sort((a, b) => b.score - a.score || a.path.localeCompare(b.path));
+    const frag = document.createDocumentFragment();
+    for (const f of files.slice(0, GREP_FILES_SHOWN)) {
+      const path = joinPath(state.root, f.path);
+      const slash = f.path.lastIndexOf("/");
+      const dir = slash > 0 ? f.path.slice(0, slash) : "";
+      const collapsed = grep.collapsed.has(f.path);
+      const nameEl = el("span", { class: "r-name" });
+      nameEl.innerHTML = markRanges(f.path.slice(slash + 1), f.nameRanges);
+      const text = el("span", { class: "r-text" }, nameEl);
+      if (dir) text.append(el("span", { class: "r-dir", title: dir }, "‎" + dir + "‎"));
+      frag.append(el("li", {
+        class: "result g-file" + (collapsed ? " collapsed" : ""),
+        role: "option",
+        title: f.path,
+        dataset: { kind: "gfile", path, rel: f.path, line: f.lines[0]?.line ?? "", key: f.path },
+      }, svg(ICON.chevron, "chev"), svg(ICON.file, "ico"), text,
+      el("span", { class: "g-count", title: `${f.count} match${f.count === 1 ? "" : "es"}` }, String(f.count))));
+      if (collapsed) continue;
+
+      const shown = grep.expanded.has(f.path) ? f.lines : f.lines.slice(0, GREP_LINES_SHOWN);
+      for (const m of shown) {
+        const t = el("span", { class: "g-text" });
+        t.innerHTML = (m.cut ? "…" : "") + markRanges(m.text, m.ranges) + (m.more ? "…" : "");
+        frag.append(el("li", {
+          class: "result g-line",
+          role: "option",
+          title: `${f.path}:${m.line}`,
+          dataset: { kind: "gline", path, rel: f.path, line: m.line, key: `${f.path}:${m.line}` },
+        }, el("span", { class: "g-ln" }, String(m.line)), t));
+      }
+      if (shown.length < f.lines.length) {
+        const n = f.lines.length - shown.length;
+        frag.append(el("li", { class: "g-more", dataset: { rel: f.path } }, `+${n} more line${n === 1 ? "" : "s"}`));
+      }
+    }
+    if (files.length > GREP_FILES_SHOWN) {
+      frag.append(el("li", { class: "r-note" }, `${files.length - GREP_FILES_SHOWN} more files not shown; refine the search.`));
+    }
+    if (!files.length && !grep.running) {
+      frag.append(el("li", { class: "r-note" }, grep.error ? "Search failed" : "No matches"));
+    }
+    dom.results.replaceChildren(frag);
+    dom.results.scrollTop = scroll;
+
+    const items = [...dom.results.querySelectorAll("li.result")];
+    const keep = items.findIndex((li) => li.dataset.key === selectedKey);
+    search.selected = Math.max(keep, 0);
+    items[search.selected]?.classList.add("selected");
+    markActive();
+  }
+
+  function grepStatus() {
+    const fmt = (n) => n.toLocaleString();
+    const plural = (n, word, suffix = "s") => `${fmt(n)} ${word}${n === 1 ? "" : suffix}`;
+    const q = dom.search.value.trim();
+    if (!q) return "Search inside Markdown files under this folder";
+    if (grep.error) return grep.error;
+    if (grep.query !== dom.search.value) return q.length < 2 ? "Press Enter to search" : "";
+    const matches = grep.files.reduce((n, f) => n + f.count, 0);
+    const found = `${plural(matches, "match", "es")} in ${plural(grep.files.length, "file")}`;
+    if (grep.running) return `Searching… ${fmt(grep.progress?.searched ?? 0)} files scanned · ${found}`;
+    const d = grep.done;
+    if (!d) return found;
+    let text = `${found} · ${fmt(d.searched)} Markdown files searched in ${d.elapsed.toFixed(1)}s`;
+    if (d.truncated) text += " · stopped early (limit reached)";
+    if (d.skippedLarge) text += ` · ${plural(d.skippedLarge, "large file")} skipped`;
+    return text;
+  }
+
+  function setSearchMode(mode) {
+    searchMode = mode;
+    store.set("searchMode", mode);
+    $("#search-box").classList.toggle("contents", mode === "contents");
+    for (const b of document.querySelectorAll("[data-mode]")) b.classList.toggle("on", b.dataset.mode === mode);
+    dom.search.placeholder = mode === "contents" ? "Search in Markdown files…  (Ctrl+Shift+F)" : "Search file names…  ( / )";
+    stopGrep();
+    rerunSearch();
+  }
+
+  const rerunSearch = () => (searchMode === "contents" ? runGrep() : runSearch());
+
+  function initGrep() {
+    for (const b of document.querySelectorAll("[data-mode]")) {
+      b.addEventListener("click", () => {
+        setSearchMode(b.dataset.mode);
+        dom.search.focus();
+      });
+    }
+    for (const b of document.querySelectorAll("[data-opt]")) {
+      const key = b.dataset.opt;
+      b.setAttribute("aria-pressed", String(grepOpts[key]));
+      b.addEventListener("click", () => {
+        grepOpts[key] = !grepOpts[key];
+        store.set("grepOpts", grepOpts);
+        b.setAttribute("aria-pressed", String(grepOpts[key]));
+        if (dom.search.value.trim()) runGrep();
+        dom.search.focus();
+      });
+    }
+    setSearchMode(searchMode);
+  }
+
+  // Wrap [start, end) character ranges of an element's text in <mark class="hit">,
+  // across however many highlight spans the text is split into.
+  function markTextRanges(root, ranges) {
+    // Merge overlapping/duplicate ranges: wrapping the same text twice would
+    // split a node at an offset it no longer has.
+    const merged = [];
+    for (const [s, e] of [...ranges].sort((a, b) => a[0] - b[0])) {
+      const last = merged[merged.length - 1];
+      if (last && s <= last[1]) last[1] = Math.max(last[1], e);
+      else merged.push([s, e]);
+    }
+    ranges = merged;
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    const nodes = [];
+    let offset = 0;
+    for (let n; (n = walker.nextNode()); offset += n.data.length) nodes.push([n, offset]);
+    for (const [node, off] of nodes) {
+      const len = node.data.length;
+      const local = ranges
+        .map(([s, e]) => [Math.max(s - off, 0), Math.min(e - off, len)])
+        .filter(([s, e]) => s < e)
+        .sort((a, b) => b[0] - a[0]); // right to left keeps earlier offsets valid
+      for (const [s, e] of local) {
+        const hit = node.splitText(s);
+        hit.splitText(e - s);
+        const mark = el("mark", { class: "hit" });
+        hit.replaceWith(mark);
+        mark.append(hit);
+      }
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -971,22 +1275,55 @@
 
   const isExternal = (href) => /^[a-z][a-z0-9+.-]*:/i.test(href) || href.startsWith("//");
 
+  // Lex Markdown and put an empty marker before each top-level block that
+  // records the source line the block starts on. marked's tokens carry no
+  // positions, but each keeps its raw source text, which we locate in order.
+  function lexWithLineMarkers(text, firstLine) {
+    const src = text.replace(/\r\n?/g, "\n");
+    const tokens = marked.lexer(src, { gfm: true });
+    const out = [];
+    let pos = 0;
+    let line = firstLine;
+    for (const t of tokens) {
+      const at = t.raw ? src.indexOf(t.raw, pos) : -1;
+      if (at !== -1) {
+        for (let i = pos; i < at; i++) if (src.charCodeAt(i) === 10) line++;
+        pos = at;
+        if (t.type !== "space") {
+          out.push({ type: "html", block: true, pre: false, raw: "", text: `<span data-md-line="${line}"></span>` });
+        }
+      }
+      out.push(t);
+    }
+    out.links = tokens.links;
+    return out;
+  }
+
   function renderMarkdown(text, filePath) {
     let frontMatter = null;
+    let firstLine = 1;
     const fm = text.match(/^---\r?\n([\s\S]*?)\r?\n(?:---|\.\.\.)[ \t]*(?:\r?\n|$)/);
     if (fm) {
       frontMatter = fm[1];
       text = text.slice(fm[0].length);
+      firstLine += fm[0].split("\n").length - 1;
     }
-    const html = marked.parse(text, { gfm: true, async: false });
+    const html = marked.parser(lexWithLineMarkers(text, firstLine), { gfm: true });
     const article = el("article", { class: "markdown" });
     article.innerHTML = DOMPurify.sanitize(html, { FORBID_TAGS: ["style"] });
+    // Move each line marker onto the block that follows it (data-line).
+    for (const marker of article.querySelectorAll(":scope > span[data-md-line]")) {
+      const next = marker.nextElementSibling;
+      if (next && !next.matches("span[data-md-line]") && !next.dataset.line) next.dataset.line = marker.dataset.mdLine;
+      marker.remove();
+    }
 
     if (frontMatter !== null) {
       const pre = el("pre", { class: "front-matter" });
       const code = el("code", { class: "hljs language-yaml" });
       code.innerHTML = highlight(frontMatter, "yaml");
       pre.append(code);
+      pre.dataset.line = "1";
       article.prepend(pre);
     }
 
@@ -1097,9 +1434,21 @@
     schedulePoll();
   }
 
-  async function openFile(path, { push = true, keepScroll = false } = {}) {
-    const token = ++state.loadToken;
+  async function openFile(path, { push = true, keepScroll = false, line = null, marks = null } = {}) {
     const sameFile = path === state.file;
+    if (!keepScroll) {
+      state.line = line;
+      state.lineMarks = marks;
+    }
+    // Another line of the file that's already open: no need to refetch.
+    if (sameFile && state.data && line && !keepScroll) {
+      writeUrl(push);
+      if (mobile.matches) closeDrawer();
+      if (preferSource()) renderFile();
+      else revealLine();
+      return;
+    }
+    const token = ++state.loadToken;
     const scroll = keepScroll ? captureScroll() : null;
     state.file = path;
     if (!sameFile) {
@@ -1135,6 +1484,7 @@
     clearTimeout(slow);
     if (token !== state.loadToken) return;
     state.data = data;
+    if (state.line) preferSource();
     renderFile();
     if (scroll) restoreScroll(scroll);
     if (!sameFile) revealPath(path, false);
@@ -1187,7 +1537,13 @@
         seg.append(el("button", {
           type: "button",
           class: state.view === view ? "on" : "",
-          onclick: () => { state.view = view; renderFile(); },
+          onclick: () => {
+            state.view = view;
+            // An explicit view choice wins over "jump to line" (which prefers source).
+            state.line = state.lineMarks = null;
+            writeUrl(false);
+            renderFile();
+          },
         }, label));
       }
       actions.push(seg);
@@ -1298,6 +1654,92 @@
       scrollToAnchor(state.pendingAnchor);
       state.pendingAnchor = null;
     }
+    if (state.line) revealLine();
+  }
+
+  // Line numbers refer to the file's source, so rendered views that can't be
+  // mapped back to lines (HTML, CSV, SVG, formatted JSON) switch to source.
+  // Rendered Markdown can: see revealMarkdownLine. Returns true if changed.
+  function preferSource() {
+    let changed = false;
+    if (["html", "csv", "image"].includes(fileType(state.data)) && state.view !== "source") {
+      state.view = "source";
+      changed = true;
+    }
+    if (state.jsonPretty) {
+      state.jsonPretty = false;
+      changed = true;
+    }
+    return changed;
+  }
+
+  function revealLine() {
+    if (dom.viewer.querySelector("article.markdown")) return revealMarkdownLine();
+    const pre = dom.viewer.querySelector("pre.code");
+    const lineEl = pre?.children[state.line - 1];
+    if (!lineEl) return;
+    pre.querySelector(".line.target")?.classList.remove("target");
+    for (const m of pre.querySelectorAll("mark.hit")) m.replaceWith(...m.childNodes);
+    lineEl.classList.add("target");
+    if (state.lineMarks) markTextRanges(lineEl, state.lineMarks);
+    lineEl.scrollIntoView({ block: "center" });
+  }
+
+  // Rendered Markdown has no line numbers. Find the block whose source starts
+  // at or before the line, then the matched text within it: the n-th
+  // occurrence in the source block maps to the n-th occurrence in its rendered
+  // text. Approximate when markup hides some (e.g. text inside a link URL);
+  // a match with no visible counterpart just isn't highlighted.
+  function revealMarkdownLine() {
+    const article = dom.viewer.querySelector("article.markdown");
+    let block = null;
+    for (const b of article.querySelectorAll(":scope > [data-line]")) {
+      if (Number(b.dataset.line) > state.line) break;
+      block = b;
+    }
+    if (!block) return;
+    article.querySelector(".md-target")?.classList.remove("md-target");
+    for (const m of article.querySelectorAll("mark.hit")) m.replaceWith(...m.childNodes);
+    block.classList.add("md-target");
+
+    const lines = state.data.content.split("\n");
+    const srcLine = (lines[state.line - 1] ?? "").replace(/\r$/, "");
+    const blockSrc = lines.slice(Number(block.dataset.line) - 1, state.line - 1).join("\n");
+    const rendered = block.textContent;
+    const count = (hay, needle) => {
+      let n = 0;
+      for (let i = hay.indexOf(needle); i !== -1; i = hay.indexOf(needle, i + needle.length)) n++;
+      return n;
+    };
+    const ranges = [];
+    for (const [s, e] of state.lineMarks || []) {
+      const needle = srcLine.slice(s, e);
+      if (!needle) continue;
+      const nth = count(blockSrc + "\n" + srcLine.slice(0, s), needle);
+      let at = rendered.indexOf(needle);
+      for (let i = 0; i < nth && at !== -1; i++) at = rendered.indexOf(needle, at + needle.length);
+      if (at !== -1) ranges.push([at, at + needle.length]);
+    }
+    if (ranges.length) markTextRanges(block, ranges);
+
+    // Narrow the highlight from a whole list/table to the item or row: the one
+    // holding the first match, or (for a bare &line= link with no match info)
+    // the innermost one containing the line's text minus Markdown syntax.
+    const first = block.querySelector("mark.hit");
+    let target = first?.closest("li, tr");
+    if (!target && !ranges.length) {
+      const plain = srcLine
+        .replace(/^\s*(?:>\s*)*(?:[-*+]\s+(?:\[[ xX]\]\s+)?|\d+[.)]\s+)?/, "")
+        .replace(/\]\([^)]*\)|[*_~`[\]|]/g, "")
+        .trim()
+        .slice(0, 40);
+      if (plain) target = [...block.querySelectorAll("li, tr")].filter((e) => e.textContent.includes(plain)).pop();
+    }
+    if (target) {
+      block.classList.remove("md-target");
+      target.classList.add("md-target");
+    }
+    (first || target || block).scrollIntoView({ block: "center" });
   }
 
   function scrollToAnchor(id) {
@@ -1356,6 +1798,7 @@
     initLayout();
     initTree();
     initSearch();
+    initGrep();
     initPicker();
     initViewer();
     try {

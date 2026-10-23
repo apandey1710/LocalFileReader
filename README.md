@@ -8,6 +8,13 @@ from any browser on your LAN or tailnet.
   and shows everything else as syntax-highlighted code (~230 languages via highlight.js).
 - Every file and folder name under the open directory is indexed, so you can search the whole tree
   (press `/` or Ctrl+K). Searches match names and paths, with fuzzy matching on names.
+- **Contents** search (Ctrl+Shift+F, seeded with any selected text) searches inside every Markdown file
+  (`.md`, `.markdown`, `.mdx`, `.mkd`, `.mdown`) under the open directory. It supports match case, whole word and (Python) regular expressions.
+  Results stream in as they're found and are ranked by relevance, with matches highlighted.
+  Clicking a match opens the file rendered, scrolled to the match with it highlighted
+  (`&line=N` in the URL, so it can be shared).
+  `node_modules`, `.git`, virtualenvs and caches are skipped unless you turn on **all**, and files
+  over 4 MB are skipped.
 - The panels are resizable (drag the divider; double-click resets). On phones the tree becomes a drawer.
 - It cannot modify files: the server has no write paths, and every non-GET request except the login form is rejected.
 

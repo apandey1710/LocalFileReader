@@ -12,12 +12,15 @@ import hashlib
 import hmac
 import html
 import json
+import math
 import mimetypes
 import os
+import re
 import socket
 import stat
 import sys
 import time
+from collections import deque
 from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -34,6 +37,23 @@ INDEX_MAX_ENTRIES = 300_000
 INDEX_MAX_SECONDS = 30
 # Virtual filesystems that are huge or never useful to index when the root is "/".
 INDEX_SKIP = {"/proc", "/sys", "/dev", "/run"}
+
+# Content search limits and defaults.
+GREP_MAX_FILE_BYTES = 4 * 1024 * 1024
+GREP_MAX_LINES = 5000          # matching lines sent in total
+GREP_MAX_LINES_PER_FILE = 100  # matching lines sent per file (all are counted)
+GREP_MAX_SECONDS = 60
+GREP_SNIPPET_CHARS = 240
+# Directories skipped by content search unless the client asks for "all".
+GREP_SKIP_DIRS = frozenset({
+    ".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv", ".tox",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache", ".next", ".cache",
+})
+# Content search only looks inside Markdown files (same extensions the viewer
+# renders as Markdown).
+GREP_EXTS = frozenset({".md", ".markdown", ".mdx", ".mkd", ".mdown"})
+# Results under these path fragments are ranked lower (generated or vendored).
+GREP_LOW_VALUE = ("node_modules/", "vendor/", "dist/", "build/", ".min.", "-lock.", ".lock")
 
 # Types that can run script when opened directly; served with a CSP sandbox so
 # they never execute with this app's origin.
@@ -103,6 +123,111 @@ def decode_text(data, truncated):
         return data.decode("cp1252"), "cp1252"
     except UnicodeDecodeError:
         return data.decode("latin-1"), "latin-1"
+
+
+def walk_tree(root, show_hidden, skip_names=frozenset()):
+    """Yield (relative path, is_dir) for everything under root.
+
+    Breadth-first, so when a caller stops early it has the shallowest entries.
+    Symlinked directories are yielded but not descended into, which also rules
+    out cycles.
+    """
+    queue = deque([""])
+    while queue:
+        rel = queue.popleft()
+        full = os.path.join(root, rel) if rel else root
+        if full in INDEX_SKIP:
+            continue
+        try:
+            it = os.scandir(full)
+        except OSError:
+            continue
+        with it:
+            for entry in it:
+                name = entry.name
+                if not show_hidden and name.startswith("."):
+                    continue
+                child = f"{rel}/{name}" if rel else name
+                try:
+                    is_dir = entry.is_dir()
+                    descend = is_dir and not entry.is_symlink() and name not in skip_names
+                except OSError:
+                    is_dir = descend = False
+                if descend:
+                    queue.append(child)
+                yield child, is_dir
+
+
+def utf16_offsets(text, offsets):
+    """Convert code-point offsets into `text` to UTF-16 offsets (what JS uses)."""
+    if all(ord(c) <= 0xFFFF for c in text):
+        return offsets
+    return [len(text[:o].encode("utf-16-le")) // 2 for o in offsets]
+
+
+def grep_text(text, pattern, literal):
+    """Find pattern matches in text, grouped by line.
+
+    Returns (match_count, word_hits, exact_hits, lines) where lines is a list of
+    [line_no, line_start, line_text, [(start, end), ...]] with ranges relative
+    to the line. Only the first GREP_MAX_LINES_PER_FILE lines are kept.
+    """
+    count = word_hits = exact_hits = 0
+    lines = []
+    line_no, pos = 1, 0
+    current = None
+    n = len(text)
+    for m in pattern.finditer(text):
+        s, e = m.span()
+        if s == e:
+            continue
+        line_no += text.count("\n", pos, s)
+        pos = s
+        count += 1
+        before = text[s - 1] if s else " "
+        after = text[e] if e < n else " "
+        if not (before.isalnum() or before == "_") and not (after.isalnum() or after == "_"):
+            word_hits += 1
+        if literal is not None and text[s:e] == literal:
+            exact_hits += 1
+        if current and current[0] == line_no:
+            current[3].append((s - current[1], e - current[1]))
+        elif len(lines) < GREP_MAX_LINES_PER_FILE:
+            start = text.rfind("\n", 0, s) + 1
+            end = text.find("\n", s)
+            current = [line_no, start, text[start:n if end == -1 else end], [(s - start, e - start)]]
+            lines.append(current)
+        else:
+            current = None
+        if count >= 10_000:
+            break
+    return count, word_hits, exact_hits, lines
+
+
+def snippet(line, ranges):
+    """Trim a matched line for display; returns a JSON-ready dict.
+
+    `col` is where the snippet starts in the full line, so the viewer can
+    re-apply the highlight ranges to the whole line. Offsets are UTF-16.
+    """
+    line = line.rstrip("\r")
+    ranges = [(s, min(e, len(line))) for s, e in ranges if s < len(line)]
+    indent = start = len(line) - len(line.lstrip())
+    if len(line) - start > GREP_SNIPPET_CHARS:
+        first = ranges[0][0] if ranges else start
+        start = max(start, first - GREP_SNIPPET_CHARS // 4)
+    end = min(len(line), start + GREP_SNIPPET_CHARS)
+    text = line[start:end]
+    flat = [o for s, e in ranges if s < end and e > start for o in (max(s, start) - start, min(e, end) - start)]
+    flat = utf16_offsets(text, flat)
+    col = utf16_offsets(line, [start])[0]
+    return {
+        "text": text,
+        "col": col,
+        "ranges": [flat[i:i + 2] for i in range(0, len(flat), 2)],
+        "cut": start > indent,
+        "more": end < len(line),
+    }
 
 
 def looks_binary(chunk):
@@ -180,6 +305,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.handle_file(query)
             if path == "/api/index":
                 return self.handle_index(query)
+            if path == "/api/grep":
+                return self.handle_grep(query)
             if path == "/api/stat":
                 return self.handle_stat(query)
             if path.startswith("/static/"):
@@ -195,6 +322,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error_json(HTTPStatus.BAD_REQUEST, "not a directory")
         except IsADirectoryError:
             self.send_error_json(HTTPStatus.BAD_REQUEST, "is a directory")
+        except re.error as e:
+            self.send_error_json(HTTPStatus.BAD_REQUEST, f"invalid regular expression: {e}")
         except (BrokenPipeError, ConnectionResetError):
             pass
         except OSError as e:
@@ -282,50 +411,113 @@ button{{background:#2563eb;color:#fff;border:0;cursor:pointer}}.err{{color:#d124
     def handle_index(self, query):
         """Recursively list every file and directory name under a directory.
 
-        Paths are returned relative to the directory. Symlinked directories are
-        listed but not descended into, which also rules out cycles.
+        Paths are returned relative to the directory.
         """
         root = resolve(query.get("path"))
         if not os.path.isdir(root):
             raise NotADirectoryError(root)
-        show_hidden = query.get("hidden") == "1"
         files, dirs = [], []
         truncated = False
         started = time.monotonic()
-        stack = [""]
-        while stack and not truncated:
-            rel = stack.pop()
-            full = os.path.join(root, rel) if rel else root
-            if full in INDEX_SKIP:
-                continue
-            try:
-                it = os.scandir(full)
-            except OSError:
-                continue
-            with it:
-                for entry in it:
-                    if not show_hidden and entry.name.startswith("."):
-                        continue
-                    child = f"{rel}/{entry.name}" if rel else entry.name
-                    try:
-                        is_dir = entry.is_dir()
-                        descend = is_dir and not entry.is_symlink()
-                    except OSError:
-                        is_dir = descend = False
-                    if is_dir:
-                        dirs.append(child)
-                        if descend:
-                            stack.append(child)
-                    else:
-                        files.append(child)
-                if (len(files) + len(dirs) >= INDEX_MAX_ENTRIES
-                        or time.monotonic() - started > INDEX_MAX_SECONDS):
-                    truncated = True
+        for i, (rel, is_dir) in enumerate(walk_tree(root, query.get("hidden") == "1")):
+            (dirs if is_dir else files).append(rel)
+            if i + 1 >= INDEX_MAX_ENTRIES or (
+                    i % 1000 == 0 and time.monotonic() - started > INDEX_MAX_SECONDS):
+                truncated = True
+                break
         self.send_json({
             "path": root,
             "files": files,
             "dirs": dirs,
             "truncated": truncated,
+            "elapsed": round(time.monotonic() - started, 3),
+        })
+
+    def handle_grep(self, query):
+        """Search file contents under a directory, streaming NDJSON events.
+
+        Events: {"type": "file", ...} per matching file (with a relevance
+        score), periodic {"type": "progress"} (which also lets us notice a
+        client that went away), and a final {"type": "done"}.
+        """
+        root = resolve(query.get("path"))
+        if not os.path.isdir(root):
+            raise NotADirectoryError(root)
+        q = query.get("q", "")
+        if not q:
+            return self.send_error_json(HTTPStatus.BAD_REQUEST, "empty query")
+        is_regex = query.get("regex") == "1"
+        case = query.get("case") == "1"
+        source = q if is_regex else re.escape(q)
+        if query.get("word") == "1":
+            source = rf"\b(?:{source})\b"
+        pattern = re.compile(source, 0 if case else re.IGNORECASE)
+        literal = None if is_regex else q
+        skip = frozenset() if query.get("all") == "1" else GREP_SKIP_DIRS
+
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.send_common_headers()
+        self.end_headers()
+        self.close_connection = True
+
+        def emit(obj):
+            self.wfile.write(json.dumps(obj, separators=(",", ":")).encode() + b"\n")
+
+        started = last_progress = time.monotonic()
+        searched = matched_files = total_matches = sent_lines = skipped = 0
+        truncated = False
+        for rel, is_dir in walk_tree(root, query.get("hidden") == "1", skip):
+            now = time.monotonic()
+            if now - last_progress > 0.25:
+                emit({"type": "progress", "searched": searched, "files": matched_files,
+                      "matches": total_matches})
+                last_progress = now
+            if now - started > GREP_MAX_SECONDS or sent_lines >= GREP_MAX_LINES:
+                truncated = True
+                break
+            if is_dir or os.path.splitext(rel)[1].lower() not in GREP_EXTS:
+                continue
+            full = os.path.join(root, rel)
+            try:
+                with open(full, "rb") as f:
+                    data = f.read(GREP_MAX_FILE_BYTES + 1)
+            except OSError:
+                continue
+            if len(data) > GREP_MAX_FILE_BYTES:
+                skipped += 1
+                continue
+            if looks_binary(data[:SNIFF_BYTES]):
+                continue
+            searched += 1
+            text, _ = decode_text(data, False)
+            count, word_hits, exact_hits, lines = grep_text(text, pattern, literal)
+            if not count:
+                continue
+            name = os.path.basename(rel)
+            name_ranges = [list(m.span()) for m in pattern.finditer(name) if m.end() > m.start()]
+            # Relevance: more (and whole-word, exact-case) matches help with
+            # diminishing returns; a matching file name helps a lot; deep or
+            # generated/vendored paths are pushed down.
+            score = (8 * math.log2(1 + count) + 12 * math.log2(1 + word_hits)
+                     + 4 * math.log2(1 + exact_hits) + (25 if name_ranges else 0)
+                     - rel.count("/") - (20 if any(p in rel for p in GREP_LOW_VALUE) else 0))
+            matched_files += 1
+            total_matches += count
+            sent_lines += len(lines)
+            emit({
+                "type": "file",
+                "path": rel,
+                "score": round(score, 2),
+                "count": count,
+                "nameRanges": [utf16_offsets(name, r) for r in name_ranges],
+                "lines": [{"line": ln, **snippet(t, rs)} for ln, _, t, rs in lines],
+            })
+        emit({
+            "type": "done", "searched": searched, "files": matched_files, "matches": total_matches,
+            "skippedLarge": skipped, "truncated": truncated,
             "elapsed": round(time.monotonic() - started, 3),
         })
 
